@@ -24,6 +24,8 @@ extern "C" {
 #include <ctype.h>
 #include <math.h>
 
+#include "cwbitset.h"
+
 //#define DEBUG
 //#define CRSXPROF
 
@@ -40,7 +42,7 @@ typedef struct _Sink *Sink;
 typedef struct _SubstitutionFrame *SubstitutionFrame;
 typedef struct _NamedPropertyLink *NamedPropertyLink;
 typedef struct _VariablePropertyLink *VariablePropertyLink;
-typedef struct _Variables *Variables;
+//typedef struct _Variables *Variables;
 typedef struct _VariableSet *VariableSet;
 typedef struct _VariableSetLink *VariableSetLink;
 typedef struct _VariableMap *VariableMap;
@@ -64,8 +66,9 @@ typedef struct _Pair* Pair;
 //
 struct _Context
 {
-    unsigned int stamp; // satisfy old C compilers and provide variable identity
-    Hashset2 literalPool;
+    unsigned int stamp;     // satisfy old C compilers and provide variable identity
+    Hashset2 literalPool;   // Pool for literals (and eventually property keys)
+    Hashset2 variablePool;  // Pool for variables. Deallocated variables are returned to this pool in order to reuse bit number.
 };
 
 //#define DEBUG
@@ -429,6 +432,26 @@ struct _Term
 #define VARIABLESET_ISEMPTY(S) (S == NULL)
 #define VARIABLESET_COUNT(S) countL(S)
 
+// bitset based
+
+#define VARIABLESET CWBitSet
+
+#define LINK_VARIABLESET(C,S) bitset_link(S)
+#define UNLINK_VARIABLESET(C,S) bitset_unlink(S)
+
+#define VARIABLESET_REMOVEALL(C,S,V,L) removeAllBS(C,S,V,L)
+#define VARIABLESET_MERGEALL(C,S1,S2) mergeAllBS(C,S1,S2)
+#define VARIABLESET_ADDVARIABLE(C,S,V) addVariableBS(C,S,V)
+#define VARIABLESET_CONTAINS(S,V) containsBS(S,V)
+#define VARIABLESET_CLEAR(C,S) clearBS(C,S)
+#define VARIABLESET_MINUS(C,S,O) minusBS(C,S,O)
+#define VARIABLESET_PRINTF(C,O,S) printfBS(C,O,S)
+#define VARIABLESET_ISEMPTY(S) ((S) == NULL)
+#define VARIABLESET_COUNT(S) countBS(S)
+//#define VARIABLESET_ADDVARIABLESOF(C, VS, S, CO, P) (addVariablesOfHS(C, VS, S, CO, P))
+
+
+
 #else
 
 // Hash set based
@@ -448,6 +471,7 @@ struct _Term
 #define VARIABLESET_ISEMPTY(S) ((S)== NULL || ((S) != AllFreeVariables && (S)->nitems == 0))
 #define VARIABLESET_COUNT(S) ((S)== NULL ? 0 : (S)->nitems)
 #define VARIABLESET_ADDVARIABLESOF(C, VS, S, CO, P) (addVariablesOfHS(C, VS, S, CO, P))
+
 
 //#define VARIABLESET Hashset2
 //
@@ -623,21 +647,23 @@ struct _SortDescriptor
 //   Variable variable = MAKE_*_VARIABLE(context, "name_candidate");
 //
 // Variables are compared as pointers with ==.  The name is a guideline and may be ignored.
+// Variables are ref counted
 //
 #define MAKE_BOUND_PROMISCUOUS_VARIABLE(context,v) makeVariable(context,v,1,0)
 #define MAKE_FRESH_PROMISCUOUS_VARIABLE(context,v) makeVariable(context,v,0,0)
 #define MAKE_BOUND_LINEAR_VARIABLE(context,v) makeVariable(context,v,1,1)
 #define MAKE_FRESH_LINEAR_VARIABLE(context,v) makeVariable(context,v,0,1)
+
 //
 struct _Variable
 {
-    char *name; // name...neither guaranteed to be globally unique nor the same as originally provided
-    unsigned int linear : 1; // whether this variable is linear
-    unsigned int bound : 1; // whether this variable is bound
-#ifdef BFREEVARS
-    unsigned hash;
-#endif
+    size_t nr;                // Number of references
+    size_t bit;               // Variable bit number.
+    char *name;               // name...neither guaranteed to be globally unique nor the same as originally provided
+    unsigned int linear : 1;  // whether this variable is linear
+    unsigned int bound  : 1;  // whether this variable is bound
 };
+
 extern Variable makeVariable(Context context, char *name, unsigned int bound, unsigned int linear);
 
 #define IS_BOUND(v) ((v)->bound)
@@ -647,6 +673,11 @@ extern Variable makeVariable(Context context, char *name, unsigned int bound, un
 #define UNBIND(variable) (variable)->bound = 0
 #define REBIND(variable) (variable)->bound = 1
 
+/**
+ * @Brief Change the variable base name.
+ *
+ * See $[VariableNameIs primitive.
+ */
 extern void setVariableBaseName(Context context, Variable variable, char *newbase);
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -692,8 +723,8 @@ extern Term makeStringLiteral(Context context, const char *text);
 // - LITERALU(sink,text): Variant ('unsafe') for constant or pre-ALLOCATEd text.
 // - LITERALF(sink,fmt,...): Same as LITERAL except the string is composed safely using vsnprintf(3) (using a large stack-allocated temp buffer).
 // - LITERALNF(sink,maxsize,fmt,...): Same as LITERAL except the string is composed using vsnprintf(3).
-// - USE(sink,v): Emit variable use event for previously allocated Variable v.
-// - BINDS(sink,rank,vs): Emit binder event for previously allocated array Variable vs[rank] (which is copied and thus can be automatic).
+// - USE(sink,v): Emit variable use event for previously allocated Variable v. Reference is transferred.
+// - BINDS(sink,rank,vs): Emit binder event for previously allocated array Variable vs[rank] (which is copied and thus can be automatic). Variable references are transferred
 // - ADD_PROPERTY_REF(sink,term): copy properties from term into the next START. Term reference is *NOT* transferred
 // - ADD_PROPERTY_NAMED(sink,name,term): add named property with value into the next START. Term reference is transferred
 // - ADD_PROPERTY_VARIABLE(sink,variable,term): add variable property with value into the next START. Term reference is transferred
@@ -779,23 +810,20 @@ struct _Buffer
     BufferSegment first; // the first segment; all allocated segments available through segment ->next chain TODO: include first segment here!
     BufferSegment last; // the last segment (with top of stack in it) or NULL when empty
     int lastTop; // index of top entry (in last segment) or <0 when empty
-    VariableSetLink pendingWeakenings; // weakenings for next START (NOTE: cannot be shared)
     NamedPropertyLink pendingNamedProperties; // named properties for next START (NOTE: cannot be shared)
     VariablePropertyLink pendingVariableProperties; // variable properties for next START (NOTE: cannot be shared)
-#ifdef FREEVARS
     VARIABLESET pendingNamedPropertiesFreeVars; // Free variables to insert before a batch of new named properties
     VARIABLESET pendingVariablePropertiesFreeVars; // Free variables to insert before a batch of new variable properties
-#endif
     unsigned free : 1; // whether the buffer structure itself should be freed
 };
+
 struct _BufferEntry
 {
     Term term; // allocated partial construction
     int index; // subterm we are working on
-#ifdef FREEVARS
     VARIABLESET freeVars; // subterm free variables
-#endif
 };
+
 struct _BufferSegment
 {
     BufferSegment previous, next; // previous and next buffer segment (NULL for first/last)
@@ -864,7 +892,7 @@ struct _SubstitutionFrame
     SubstitutionFrame parent;  // parent frame (or NULL)
     int parentCount;           // number of variable-substitute pairs in all parent frames
     int count;                 // number of variable-substitute pairs in this frame
-    Variable *variables;       // count redex variables to substitute, in order
+    Variable *variables;       // count redex variables to substitute, in order. Does not own variable reference.
     Term *substitutes;         // count redex subterms to substitute for variables, in order
     int* renamings;            // Whether substitute is caused by a binder renaming.
 };
@@ -958,15 +986,16 @@ extern VariablePropertyLink UNLINK_VariablePropertyLink(Context context, Variabl
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // CONSTANT SET OF VARIABLES.
 
-struct _Variables
-{
-    size_t size;
-    Variable variables[]; // of length count
-};
-// Create fixes size variable array; seeds array by copying pointers from originals.
-extern Variables variablesMake(Context context, size_t size, Variable originals[]);
-// Check whether array contains a variable.
-extern int variablesContain(Variables vs, Variable v);
+//struct _Variables
+//{
+//    size_t size;
+//    Variable variables[]; // of length count
+//};
+
+//// Create fixes size variable array; seeds array by copying pointers from originals.
+//extern Variables variablesMake(Context context, size_t size, Variable originals[]);
+//// Check whether array contains a variable.
+//extern int variablesContain(Variables vs, Variable v);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // GENERIC VARIABLE SETS AND MAPS
@@ -1152,6 +1181,29 @@ struct _VariableSet2
     	struct _Hashset2 hash;
     } set;
 };
+
+// BitSet based variable set
+
+// Count variable set links.
+extern unsigned countBS(CWBitSet set);
+// Add variable to set. Create new set if needed.
+extern CWBitSet addVariableBS(Context context, CWBitSet set, Variable variable);
+// Check whether set contains a variable.
+extern int containsBS(CWBitSet set, Variable variable);
+// Check whether set contains a variable of given name. Debugging use only
+extern int containsNameBS(CWBitSet link, char* name);
+// Check whether variable links list contains a variable and returns the link (no ref transferred), or NULL
+extern VariableSetLink variableSetLinkForBS(CWBitSet link, Variable variable);
+// Merge the two sets. Both references are transferred.
+extern CWBitSet mergeAllBS(Context context, CWBitSet first, CWBitSet second);
+// Remove all variables contains in other from set. 'set' reference is transferred. 'other' is not transferred.
+extern CWBitSet minusBS(Context context, CWBitSet set, CWBitSet other);
+// Remove all given variables from set. 'set' reference is transferred.
+extern CWBitSet removeAllBS(Context context, CWBitSet set, Variable* vars, int len);
+// Clear set
+extern CWBitSet clearBS(Context context, CWBitSet set);
+// Print out set
+extern void printfBS(Context context, FILE* out, CWBitSet set);
 
 
 // Link-list based map
