@@ -158,10 +158,14 @@ static int checkTerm4(Context context, Term parent, unsigned index, Term term, i
 /////////////////////////////////////////////////////////////////////////////////
 // Variable allocation.
 
-Variable makeVariable(Context context, char *name, unsigned int bound, unsigned int linear)
+Variable
+makeVariable(Context context, char *name, unsigned int bound, unsigned int linear)
 {
     ASSERT(context, context && name);
+
+    // TODO: use pool
     Variable v = ALLOCATE(context, sizeof(struct _Variable));
+    v->nr = 1;
     int len = strlen(name);
 
     char *nameu = name;
@@ -185,10 +189,25 @@ Variable makeVariable(Context context, char *name, unsigned int bound, unsigned 
     return v;
 }
 
-void freeVariable(Context context, Variable variable)
+static inline void
+unlinkVariable(Context context, Variable variable)
 {
-    FREE(context, variable->name);
-    FREE(context, variable);
+    ASSERT(context, variable->nr > 0);
+
+    variable->nr --;
+    if (variable->nr == 0)
+    {
+        // TODO: return to pool
+        FREE(context, variable->name);
+        FREE(context, variable);
+    }
+}
+
+static inline Variable
+linkVariable(Context context, Variable variable)
+{
+    variable->nr ++;
+    return variable;
 }
 
 void setVariableBaseName(Context context, Variable variable, char *newbase)
@@ -318,19 +337,17 @@ Term makeStringLiteral(Context context, const char *text)
 /////////////////////////////////////////////////////////////////////////////////
 // Buffer manipulation.
 
-#ifdef FREEVARS
-
-// Returns the list of free variables of the given term.
-// TODO: deprecate as it is expensive when set is a hash.
-static VARIABLESET freeVars(Context context, Term term)
+/**
+ * @Brief Returns the list of free variables of the given term.
+ */
+static
+VARIABLESET freeVars(Context context, Term term)
 {
 	if (IS_VARIABLE_USE(term))
-		return VARIABLESET_ADDVARIABLE(context, NULL, VARIABLE(term));
+		return VARIABLESET_ADDVARIABLE(context, NULL, linkVariable(context, VARIABLE(term)));
 
 	return LINK_VARIABLESET(context, asConstruction(term)->fvs);
 }
-#endif
-
 
 static void bufferPush(Buffer buffer, Term term)
 {
@@ -438,8 +455,6 @@ Sink bufferStart(Sink sink, ConstructionDescriptor descriptor)
     ASSERT(sink->context, sink->kind == SINK_IS_BUFFER);
     Buffer buffer = (Buffer) sink;
 
-#ifdef FREEVARS
-
     if (buffer->pendingNamedProperties && buffer->pendingNamedPropertiesFreeVars
     		&& namedPropertyFreeVars(buffer->pendingNamedProperties) != buffer->pendingNamedPropertiesFreeVars)
     {
@@ -478,7 +493,6 @@ Sink bufferStart(Sink sink, ConstructionDescriptor descriptor)
     	UNLINK_VARIABLESET(sink->context, buffer->pendingVariablePropertiesFreeVars);
     }
 
-#endif
 
     Construction construction = ALLOCATE(sink->context, descriptor->size);
     //DEBUGF(sink->context, "//START(%d)\n", buffer->lastTop);
@@ -489,30 +503,21 @@ Sink bufferStart(Sink sink, ConstructionDescriptor descriptor)
 #endif
     construction->namedProperties = buffer->pendingNamedProperties;
     construction->variableProperties = buffer->pendingVariableProperties;
-#ifdef WEAKENINGS
-    construction->weakenings = buffer->pendingWeakenings;
-#endif
-#ifdef FREEVARS
     construction->fvs = NULL;
     construction->nfvs = LINK_VARIABLESET(sink->context, namedPropertyFreeVars(buffer->pendingNamedProperties));
     construction->vfvs = LINK_VARIABLESET(sink->context, variablePropertyFreeVars(buffer->pendingVariableProperties));
-#endif
     construction->nf = 0;
     construction->nostep = 0;
     // term->sub and term->binders will be populated incrementally.
+
     bufferPush(buffer, (Term) construction); // suspend current construction in favor of children
+
     // Setup fresh context for first child.
-#ifdef WEAKENINGS
-    buffer->pendingWeakenings = NULL;
-#endif
     buffer->pendingNamedProperties = NULL;
     buffer->pendingVariableProperties = NULL;
-#ifdef FREEVARS
     buffer->pendingVariablePropertiesFreeVars = NULL;
     buffer->pendingNamedPropertiesFreeVars = NULL;
-#endif
     return sink;
-
 }
 
 Sink bufferEnd(Sink sink, ConstructionDescriptor descriptor)
@@ -527,10 +532,7 @@ Sink bufferEnd(Sink sink, ConstructionDescriptor descriptor)
     Term childTerm = bufferTop(buffer)->term;
 
     if (ARITY(childTerm) != bufferTop(buffer)->index)
-    {
-        printf("%s\n", descriptor->name(NULL) );
-        ASSERT(sink->context, ARITY(childTerm) == bufferTop(buffer)->index);
-    }
+        ERRORF(sink->context, "Invalid number of subterms for constructor %s\n", descriptor->name(NULL));
 
     // Update nf and nostep fields of construction.
     if (IS_DATA(childTerm))
@@ -550,40 +552,18 @@ Sink bufferEnd(Sink sink, ConstructionDescriptor descriptor)
     	asConstruction(childTerm)->nostep = 0;
     }
 
-#ifdef FREEVARS
 	propagateFreeVariables(sink->context, childTerm);
-#endif
 
 	bufferPop(buffer);
     bufferInsert(buffer, childTerm);
 
-    // Fresh context for next child.
-    // TODO: Needed?
-    buffer->pendingWeakenings = NULL;
     buffer->pendingNamedProperties = NULL;
     buffer->pendingVariableProperties = NULL;
-
-#ifdef FREEVARS
     buffer->pendingVariablePropertiesFreeVars = NULL;
     buffer->pendingNamedPropertiesFreeVars = NULL;
-#endif
 
     return sink;
 }
-
-//Sink bufferLiteral(Sink sink, const char *text)
-//{
-//#   ifdef DEBUG
-//    ++eventCount;
-//#   endif
-//    ASSERT(sink->context, sink->kind == SINK_IS_BUFFER);
-//    Buffer buffer = (Buffer) sink;
-//    //DEBUGF(sink->context, "//LITERAL(%d)\n", buffer->lastTop);
-//    bufferStart(sink, &literalConstructionDescriptor);
-//    ((Literal) bufferTop(buffer)->term)->text = text; // descriptor set by start
-//    bufferEnd(sink, &literalConstructionDescriptor);
-//    return sink;
-//}
 
 Sink bufferLiteral(Sink sink, const char *text)
 {
@@ -639,13 +619,11 @@ Sink bufferUse(Sink sink, Variable variable)
 #ifdef CRSXPROF
 	use->term.marker = 0;
 #endif
-    use->variable = variable;
+    use->variable = variable; // Consume reference
     use->term.descriptor = NULL; // this ensures the term is understood as a VariableUse
     bufferInsert(buffer, (Term) use);
 
     // Fresh context for next child.
-    // TODO: needed?
-    buffer->pendingWeakenings = NULL;
     buffer->pendingNamedProperties = NULL;
     buffer->pendingVariableProperties = NULL;
     return sink;
@@ -681,18 +659,13 @@ Sink bufferCopy(Sink sink, Term term)
 {
     ASSERT(sink->context, sink->kind == SINK_IS_BUFFER);
     ASSERT(sink->context, term->nr > 0);
-    //CRSX_CHECK(sink->context, term);
-    //ASSERT(sink->context, check(sink->context, term));
 
     Buffer buffer = (Buffer) sink;
 
-    // If no properties and weakenings, just share!
+    // If no additional properties, just share!
 	if (IS_VARIABLE_USE(term)
 			|| (buffer->pendingNamedProperties == asConstruction(term)->namedProperties
-					&& buffer->pendingVariableProperties == asConstruction(term)->variableProperties
-#ifdef WEAKENINGS
-					&& !buffer->pendingWeakenings
-#endif
+			&& buffer->pendingVariableProperties == asConstruction(term)->variableProperties
 			   ))
 	{
 		UNLINK_NamedPropertyLink(sink->context, buffer->pendingNamedProperties);
@@ -700,13 +673,12 @@ Sink bufferCopy(Sink sink, Term term)
 		UNLINK_VariablePropertyLink(sink->context, buffer->pendingVariableProperties);
 		buffer->pendingVariableProperties = NULL;
 
-#ifdef FREEVARS
 		UNLINK_VARIABLESET(sink->context, buffer->pendingNamedPropertiesFreeVars);
 		buffer->pendingNamedPropertiesFreeVars = NULL;
 		UNLINK_VARIABLESET(sink->context, buffer->pendingVariablePropertiesFreeVars);
 		buffer->pendingVariablePropertiesFreeVars = NULL;
-#endif
-        bufferInsert(buffer, term);
+
+		bufferInsert(buffer, term);
         return sink;
 	}
 
@@ -717,7 +689,7 @@ Sink bufferCopy(Sink sink, Term term)
 
     if (LINK_COUNT(term) == 1)
     {
-    	// Reuse original term (with updated properties and weakenings).
+    	// Reuse original term (with updated properties).
     	Construction c = asConstruction(term);
 
     	bufferMergeProperties(sink->context, buffer, c);
@@ -726,110 +698,93 @@ Sink bufferCopy(Sink sink, Term term)
     }
     else
     {
-    	// Construction cannot be reused: deep copy (with hopefully some reuse
+    	// Construction cannot be reused: the root node is copied.
+        // Unfortunately if it contains binders, they need to be renamed
 
-		if (IS_VARIABLE_USE(term))
-		{
-			USE(sink, VARIABLE(term));
-			UNLINK(sink->context, term);
-		}
-		else
-		{
-			// construction
-			Construction c = asConstruction(term);
+        Construction c = asConstruction(term);
 
-			// Construct
-			if (IS_LITERAL(term))
-			{
-				LITERALU(sink, TEXT(term));
-			}
-			else
-			{
-				NamedPropertyLink namedLink = buffer->pendingNamedProperties;
-				buffer->pendingNamedProperties = LINK_NamedPropertyLink(sink->context, c->namedProperties);
-				VariablePropertyLink variableLink = buffer->pendingVariableProperties;
-				buffer->pendingVariableProperties = LINK_VariablePropertyLink(sink->context, c->variableProperties);
+        // Construct
+        if (IS_LITERAL(term))
+        {
+            LITERALU(sink, TEXT(term));
+        }
+        else
+        {
+            NamedPropertyLink namedLink = buffer->pendingNamedProperties;
+            buffer->pendingNamedProperties = LINK_NamedPropertyLink(sink->context, c->namedProperties);
+            VariablePropertyLink variableLink = buffer->pendingVariableProperties;
+            buffer->pendingVariableProperties = LINK_VariablePropertyLink(sink->context, c->variableProperties);
 
-#ifdef FREEVARS
-				VARIABLESET fvNamedLink = buffer->pendingNamedPropertiesFreeVars;
-				buffer->pendingNamedPropertiesFreeVars = NULL;
-				VARIABLESET fvVariableLink = buffer->pendingVariablePropertiesFreeVars;
-				buffer->pendingVariablePropertiesFreeVars = NULL;
-#endif
-#ifdef WEAKENINGS
-				VariableSetLink weakeningLink = buffer->pendingWeakenings;
-				buffer->pendingWeakenings = c->weakenings;
-#endif
+            VARIABLESET fvNamedLink = buffer->pendingNamedPropertiesFreeVars;
+            buffer->pendingNamedPropertiesFreeVars = NULL;
+            VARIABLESET fvVariableLink = buffer->pendingVariablePropertiesFreeVars;
+            buffer->pendingVariablePropertiesFreeVars = NULL;
 
-				sink->start(sink, c->term.descriptor);
+            sink->start(sink, c->term.descriptor);
 
-				buffer->pendingNamedProperties = namedLink;
-				buffer->pendingVariableProperties = variableLink;
-#ifdef FREEVARS
-				buffer->pendingNamedPropertiesFreeVars = fvNamedLink;
-				buffer->pendingVariablePropertiesFreeVars = fvVariableLink;
-#endif
-#ifdef WEAKENINGS
-				buffer->pendingWeakenings = weakeningLink;
-#endif
-				bufferMergeProperties(sink->context, buffer, asConstruction(bufferTop(buffer)->term));
+            buffer->pendingNamedProperties = namedLink;
+            buffer->pendingVariableProperties = variableLink;
+            buffer->pendingNamedPropertiesFreeVars = fvNamedLink;
+            buffer->pendingVariablePropertiesFreeVars = fvVariableLink;
 
-				int a = ARITY(term);
-				int i;
-				for (i = 0; i < a; i ++)
-				{
-					const int rank = RANK(term, i);
-					if (rank == 0)
-					{
-						// --  i'th subterm with no binders: just continue copying.
-						COPY(sink, LINK(sink->context, SUB(term, i)));
-					}
-					else
-					{
-						Variable *oldBinders = BINDERS(term, i);
-					    Variable *subBinders = ALLOCA(sink->context, rank*sizeof(Variable)); // does not escapes
-					    VariableUse subUses[rank]; // does not escape
-					    struct _SubstitutionFrame _subSubstitution = {NULL, 0, rank, oldBinders, (Term *) subUses, RENAME_ALL}; // does not escape
-					    SubstitutionFrame subSubstitution = &_subSubstitution;
+            bufferMergeProperties(sink->context, buffer, asConstruction(bufferTop(buffer)->term));
 
-					    // --- populate per binder
-					    int j;
-					    for (j = 0; j < rank; ++j)
-					    {
-					    	char *oldname = oldBinders[j]->name;
-					        char *baseendp = strrchr(oldname, '_');
-					        char *basename = oldname;
-					        if (baseendp)
-					        {
-					        	const int z = baseendp - oldname;
-					            basename = ALLOCA(sink->context, z+1); // does not escape
-					            memcpy(basename, oldname, z);
-					            basename[z] = '\0';
-					        }
-					        int isLinear = IS_LINEAR(oldBinders[j]);
-					        subBinders[j] = makeVariable(sink->context, oldBinders[j]->name, 1, isLinear); // escapes
-					        subUses[j] = ALLOCATE(sink->context, sizeof(struct _VariableUse)); // escapes
-					        subUses[j]->term.descriptor = NULL;
-					        subUses[j]->term.nr = 1;
-					        subUses[j]->variable = subBinders[j];
-					    }
+            int a = ARITY(term);
+            int i;
+            for (i = 0; i < a; i ++)
+            {
+                const int rank = RANK(term, i);
+                if (rank == 0)
+                {
+                    // --  i'th subterm with no binders: just continue copying.
+                    COPY(sink, LINK(sink->context, SUB(term, i)));
+                }
+                else
+                {
+                    // Bad case: binders must be renamed.
 
-					    // --- send new binders
-					    BINDS(sink, rank, subBinders); // escape of subBinders!
-					    //FREE(sink->context, subBinders) (no need: allocated on the stack)
-					    // --- now process subterm!
-					    metaSubstitute(sink, LINK(sink->context, SUB(term, i)), subSubstitution);
-					}
-				}
-				sink->end(sink, c->term.descriptor);
-			}
-			UNLINK(sink->context, term);
-		}
+                    Variable *oldBinders = BINDERS(term, i);
+                    Variable *subBinders = ALLOCA(sink->context, rank*sizeof(Variable)); // does not escapes
+                    VariableUse subUses[rank]; // does not escape
+                    struct _SubstitutionFrame _subSubstitution = {NULL, 0, rank, oldBinders, (Term *) subUses, RENAME_ALL}; // does not escape
+                    SubstitutionFrame subSubstitution = &_subSubstitution;
+
+                    // --- populate per binder
+                    int j;
+                    for (j = 0; j < rank; ++j)
+                    {
+                        char *oldname = oldBinders[j]->name;
+                        char *baseendp = strrchr(oldname, '_');
+                        char *basename = oldname;
+                        if (baseendp)
+                        {
+                            const int z = baseendp - oldname;
+                            basename = ALLOCA(sink->context, z+1); // does not escape
+                            memcpy(basename, oldname, z);
+                            basename[z] = '\0';
+                        }
+                        int isLinear = IS_LINEAR(oldBinders[j]);
+                        subBinders[j] = makeVariable(sink->context, oldBinders[j]->name, 1, isLinear); // escapes
+                        subUses[j] = ALLOCATE(sink->context, sizeof(struct _VariableUse)); // escapes
+                        subUses[j]->term.descriptor = NULL;
+                        subUses[j]->term.nr = 1;
+                        subUses[j]->variable = subBinders[j];
+                    }
+
+                    // --- send new binders
+                    BINDS(sink, rank, subBinders); // Transfer reference to variables.
+
+                    // --- now process subterm!
+                    metaSubstitute(sink, LINK(sink->context, SUB(term, i)), subSubstitution);
+                }
+            }
+            sink->end(sink, c->term.descriptor);
+        }
+        UNLINK(sink->context, term);
+
     }
-#ifdef WEAKENINGS
-    ASSERT(sink->context, !buffer->pendingWeakenings);
-#endif
-	ASSERT(sink->context, !buffer->pendingNamedProperties);
+
+    ASSERT(sink->context, !buffer->pendingNamedProperties);
 	ASSERT(sink->context, !buffer->pendingVariableProperties);
 
     return sink;
@@ -837,37 +792,11 @@ Sink bufferCopy(Sink sink, Term term)
 
 Sink bufferWeakeningRef(Sink sink, Construction construction)
 {
-#ifdef WEAKENINGS
-
-	// Must be first weakening event.
-	ASSERT(sink->context, sink->kind == SINK_IS_BUFFER);
-	Buffer buffer = (Buffer) sink;
-	ASSERT(sink->context, !buffer->pendingWeakenings);
-
-	buffer->pendingWeakenings = LINK_VariableSetLink(sink->context, construction->weakenings);
-#endif
 	return sink;
 }
 
 Sink bufferWeaken(Sink sink, Variable variable)
 {
-#ifdef WEAKENINGS
-#   ifdef DEBUG
-    ++eventCount;
-#   endif
-    ASSERT(sink->context, sink->kind == SINK_IS_BUFFER);
-    Buffer buffer = (Buffer) sink;
-    //DEBUGF(sink->context, "//WEAKEN(%d)\n", buffer->lastTop);
-
-    if (IS_BOUND(variable) && !variableSetLinkFor(buffer->pendingWeakenings, variable)) // only bound variables are kept weak TODO: fix that not-yet-substituted variables are not bound...
-    {
-        VariableSetLink link = ALLOCATE(sink->context, sizeof(struct _VariableSetLink));
-        link->nr = 1;
-        link->link = buffer->pendingWeakenings;
-        link->variable = variable;
-        buffer->pendingWeakenings = link;
-    }
-#endif
     return sink;
 }
 
@@ -901,12 +830,10 @@ Sink bufferProperties(Sink sink, NamedPropertyLink namedProperties, VariableProp
 	buffer->pendingNamedProperties = namedProperties;
 	buffer->pendingVariableProperties = variableProperties;
 
-#ifdef FREEVARS
 	buffer->pendingNamedPropertiesFreeVars = LINK_VARIABLESET(sink->context, namedPropertyFreeVars(namedProperties));
 	buffer->pendingVariablePropertiesFreeVars = LINK_VARIABLESET(sink->context, variablePropertyFreeVars(variableProperties));
 
 	ASSERT(sink->context, (variableProperties && buffer->pendingVariablePropertiesFreeVars) || (!variableProperties && !buffer->pendingVariablePropertiesFreeVars));
-#endif
 
 	return sink;
 }
@@ -933,9 +860,8 @@ Sink bufferPropertyNamed(Sink sink, const char *name, Term term)
     link->u.term = term; // Transfer ref
     buffer->pendingNamedProperties = link;
 
-#ifdef FREEVARS
     buffer->pendingNamedPropertiesFreeVars = VARIABLESET_MERGEALL(sink->context, buffer->pendingNamedPropertiesFreeVars, freeVars(sink->context, term));
-#endif
+
     return sink;
 }
 
@@ -960,60 +886,14 @@ Sink bufferPropertyVariable(Sink sink, Variable variable, Term term)
     link->u.term = term; // Transfer ref
     buffer->pendingVariableProperties = link;
 
-#ifdef FREEVARS
     buffer->pendingVariablePropertiesFreeVars = VARIABLESET_MERGEALL(sink->context, buffer->pendingVariablePropertiesFreeVars, freeVars(sink->context, term));
-    buffer->pendingVariablePropertiesFreeVars = VARIABLESET_ADDVARIABLE(sink->context, buffer->pendingVariablePropertiesFreeVars, variable);
-#endif
+    buffer->pendingVariablePropertiesFreeVars = VARIABLESET_ADDVARIABLE(sink->context, buffer->pendingVariablePropertiesFreeVars, linkVariable(sink->context, variable));
 
     return sink;
 }
 
 Sink bufferPropertyWeaken(Sink sink, Variable weakening)
 {
-#ifdef WEAKENINGS
-
-#   ifdef DEBUG
-    ++eventCount;
-#   endif
-    ASSERT(sink->context, sink->kind == SINK_IS_BUFFER);
-    ASSERT(sink->context, weakening);
-    if (IS_BOUND(weakening)) // only bound variables added...
-    {
-        Buffer buffer = (Buffer) sink;
-        {
-            NamedPropertyLink link;
-            for (link = buffer->pendingNamedProperties; link; link = link->link)
-                if (link->name == Closed || (!link->name && link->u.weakening == weakening))
-                    return sink; // escape because we already have this weakening!
-            // TODO: rulescompiler shopuld not insert redundant weakenings (for REBOUND variables)!
-        }
-
-        // The link is new!
-        {
-            NamedPropertyLink link = ALLOCATE(sink->context, sizeof(struct _NamedPropertyLink));
-            link->link = buffer->pendingNamedProperties; // transfer ref
-            link->nr = 1;
-#ifdef CRSXPROF
-            link->marker = 0;
-#endif
-            link->name = NULL;
-            link->u.weakening = weakening;
-            buffer->pendingNamedProperties = link;
-        }
-
-        {
-            VariablePropertyLink link = ALLOCATE(sink->context, sizeof(struct _VariablePropertyLink));
-            link->link = buffer->pendingVariableProperties; // transfer ref
-            link->nr = 1;
-#ifdef CRSXPROF
-            link->marker = 0;
-#endif
-            link->variable = NULL;
-            link->u.weakening = weakening;
-            buffer->pendingVariableProperties = link;
-        }
-    }
-#endif
     return sink;
 }
 
@@ -1025,22 +905,16 @@ Sink bufferPropertiesReset(Sink sink)
     ASSERT(sink->context, sink->kind == SINK_IS_BUFFER);
     Buffer buffer = (Buffer) sink;
     //DEBUGF(sink->context, "//RESET_PROPERTIES(%d)\n", buffer->lastTop);
-#ifdef WEAKENINGS
-    UNLINK_VariableSetLink(sink->context, buffer->pendingWeakenings);
-    buffer->pendingWeakenings = NULL;
-#endif
     UNLINK_NamedPropertyLink(sink->context, buffer->pendingNamedProperties);
     buffer->pendingNamedProperties = NULL;
     UNLINK_VariablePropertyLink(sink->context, buffer->pendingVariableProperties);
     buffer->pendingVariableProperties = NULL;
 
-#ifdef FREEVARS
     UNLINK_VARIABLESET(sink->context, buffer->pendingNamedPropertiesFreeVars);
     buffer->pendingNamedPropertiesFreeVars = NULL;
 
     UNLINK_VARIABLESET(sink->context, buffer->pendingVariablePropertiesFreeVars);
     buffer->pendingVariablePropertiesFreeVars = NULL;
-#endif
     return sink;
 }
 
@@ -1075,15 +949,10 @@ Sink initBuffer(Context context, Buffer buffer, int free)
     buffer->lastTop = -1;
     buffer->last = NULL;;
     buffer->term = NULL;
-#ifdef WEAKENINGS
-    buffer->pendingWeakenings = NULL;
-#endif
     buffer->pendingNamedProperties = NULL;
     buffer->pendingVariableProperties = NULL;
-#ifdef FREEVARS
     buffer->pendingNamedPropertiesFreeVars = NULL;
     buffer->pendingVariablePropertiesFreeVars = NULL;
-#endif
     buffer->free = free;
     // Return as sink for reception...
     return (Sink) buffer;
@@ -1107,13 +976,13 @@ void freeBuffer(Sink sink)
     	FREE(sink->context, buffer);
 }
 
-static void bufferMergeProperties(Context context, Buffer buffer, Construction construction)
+static
+void bufferMergeProperties(Context context, Buffer buffer, Construction construction)
 {
 	if (buffer->pendingNamedProperties && construction->namedProperties != buffer->pendingNamedProperties)
 	{
-#ifdef FREEVARS
 		VARIABLESET freeVars = namedPropertyFreeVars(construction->namedProperties);
-#endif
+
 		if (!construction->namedProperties)
 			construction->namedProperties = buffer->pendingNamedProperties; // transfer ref
 		else
@@ -1136,10 +1005,9 @@ static void bufferMergeProperties(Context context, Buffer buffer, Construction c
 #endif
 				if (newLink->name) // Always the case as pending free variables are not yet been linked.
 					(void) LINK(context, newLink->u.term);
-#ifdef FREEVARS
 				else
 					LINK_VARIABLESET(context, (VARIABLESET) newLink->u.weakening);
-#endif
+
 				if (newTop)
 					newLast->link = LINK_NamedPropertyLink(context, newLink);
 				else
@@ -1148,7 +1016,6 @@ static void bufferMergeProperties(Context context, Buffer buffer, Construction c
 			}
 			newLast->link = construction->namedProperties; // transfer ref to old properties to tail of new.
 
-
 			// Set final links
 			construction->namedProperties = LINK_NamedPropertyLink(context, newTop);
 	    	UNLINK_NamedPropertyLink(context, buffer->pendingNamedProperties);
@@ -1156,7 +1023,6 @@ static void bufferMergeProperties(Context context, Buffer buffer, Construction c
 		}
 		buffer->pendingNamedProperties = NULL;
 
-#ifdef FREEVARS
 		// Merge free variables and put them in front of property list
 		freeVars = VARIABLESET_MERGEALL(context, freeVars, LINK_VARIABLESET(context, buffer->pendingNamedPropertiesFreeVars));
 
@@ -1176,24 +1042,20 @@ static void bufferMergeProperties(Context context, Buffer buffer, Construction c
 			construction->nfvs = VARIABLESET_MERGEALL(context, construction->nfvs, buffer->pendingNamedPropertiesFreeVars);
 			buffer->pendingNamedPropertiesFreeVars = NULL; // reference has just transferred
 		}
-#endif
 	}
 	else
 	{
 		UNLINK_NamedPropertyLink(context, buffer->pendingNamedProperties);
 		buffer->pendingNamedProperties = NULL;
 
-#ifdef FREEVARS
 		UNLINK_VARIABLESET(context, buffer->pendingNamedPropertiesFreeVars);
 		buffer->pendingNamedPropertiesFreeVars = NULL;
-#endif
 	}
 
 	if (buffer->pendingVariableProperties && construction->variableProperties != buffer->pendingVariableProperties)
 	{
-#ifdef FREEVARS
 		VARIABLESET freeVars = variablePropertyFreeVars(construction->variableProperties);
-#endif
+
 		if (!construction->variableProperties)
 			construction->variableProperties = buffer->pendingVariableProperties;
 		else
@@ -1215,10 +1077,9 @@ static void bufferMergeProperties(Context context, Buffer buffer, Construction c
 				newLink->nr = 0;
 				if (newLink->variable)
 					(void) LINK(context, newLink->u.term);
-#ifdef FREEVARS
 				else
 					LINK_VARIABLESET(context, (VARIABLESET) newLink->u.weakening);
-#endif
+
 				if (newTop)
 					newLast->link = LINK_VariablePropertyLink(context, newLink);
 				else
@@ -1228,9 +1089,6 @@ static void bufferMergeProperties(Context context, Buffer buffer, Construction c
 				count++;
 			}
 
-			if (count > 30)
-							printf("Large merge: %d\n", count);
-
 			newLast->link = construction->variableProperties;
 			construction->variableProperties = LINK_VariablePropertyLink(context, newTop);
 
@@ -1238,7 +1096,6 @@ static void bufferMergeProperties(Context context, Buffer buffer, Construction c
 
 		}
 		buffer->pendingVariableProperties = NULL;
-#ifdef FREEVARS
 		// Merge free variables and put them in front of property list
 		freeVars = VARIABLESET_MERGEALL(context, freeVars, LINK_VARIABLESET(context, buffer->pendingVariablePropertiesFreeVars));
 
@@ -1257,34 +1114,15 @@ static void bufferMergeProperties(Context context, Buffer buffer, Construction c
 		// And add to the construction..
 		construction->vfvs =  VARIABLESET_MERGEALL(context, construction->vfvs, buffer->pendingVariablePropertiesFreeVars);
 		buffer->pendingVariablePropertiesFreeVars = NULL; // Ref has been transferred.
-#endif
 	}
 	else
 	{
 		UNLINK_VariablePropertyLink(context, buffer->pendingVariableProperties);
 		buffer->pendingVariableProperties = NULL;
-#ifdef FREEVARS
+
 		UNLINK_VARIABLESET(context, buffer->pendingVariablePropertiesFreeVars);
 		buffer->pendingVariablePropertiesFreeVars = NULL;
-#endif
 	}
-
-#ifdef WEAKENINGS
-	if (buffer->pendingWeakenings)
-	{
-		if (!construction->weakenings)
-			construction->weakenings = buffer->pendingWeakenings;
-		else
-		{
-			// Cannot share but must insert copy of pending properties.
-			if (construction->weakenings->nr == 1)
-				construction->weakenings = mergeAllL(context, buffer->pendingWeakenings, construction->weakenings); // Transfer ref
-			else
-				construction->weakenings = mergeAllL(context, buffer->pendingWeakenings, copyL(context, construction->weakenings)); // Transfer ref
-		}
-		buffer->pendingWeakenings = NULL;
-   	}
-#endif
 }
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -1292,63 +1130,34 @@ static void bufferMergeProperties(Context context, Buffer buffer, Construction c
 
 void weakenings_of(Sink sink, Term term)
 {
-#ifdef WEAKENINGS
-    if (IS_CONSTRUCTION(term))
-    {
-    	sink->weakeningRef(sink, asConstruction(term));
-       /* Construction construction = asConstruction(term);
-        VariableSetLink ws;
-        for (ws = construction->weakenings; ws; ws = ws->link)
-            sink->weaken(sink, ws->variable);
-       */
-    }
-#endif
 }
 
 void weakenings_copy(Context context, Term source, Term target)
 {
-//    if (IS_CONSTRUCTION(source) && IS_CONSTRUCTION(target))
-//    {
-//        Construction sourceConstruction = asConstruction(source);
-//        Construction targetConstruction = asConstruction(target);
-//        VariableSetLink s, t = targetConstruction->weakenings;
-//        for (s = sourceConstruction->weakenings; s; s = s->link)
-//        {
-//            if (!variableSetLinkFor(t, s->variable))
-//            {
-//                VariableSetLink newt = (VariableSetLink) ALLOCATE(context, sizeof(struct _VariableSetLink));
-//                newt->variable = s->variable;
-//                newt->link = t;
-//                t = newt;
-//            }
-//        }
-//        targetConstruction->weakenings = t;
-//    }
 }
-
 
 /////////////////////////////////////////////////////////////////////////////////
 // Variables.
 
-Variables variablesMake(Context context, size_t size, Variable originals[])
-{
-    Variables vs = ALLOCATE(context, sizeof(struct _Variables) + size*sizeof(Variable));
-    vs->size = size;
-    memcpy(&vs->variables[0], &originals[0], size*sizeof(Variable));
-    return vs;
-}
-
-int variablesContain(Variables vs, Variable v)
-{
-    size_t i;
-    for (i = 0; i < vs->size; ++i)
-        if (v == vs->variables[i])
-            return 1;
-    return 0;
-}
+//Variables variablesMake(Context context, size_t size, Variable originals[])
+//{
+//    Variables vs = ALLOCATE(context, sizeof(struct _Variables) + size*sizeof(Variable));
+//    vs->size = size;
+//    memcpy(&vs->variables[0], &originals[0], size*sizeof(Variable));
+//    return vs;
+//}
+//
+//int variablesContain(Variables vs, Variable v)
+//{
+//    size_t i;
+//    for (i = 0; i < vs->size; ++i)
+//        if (v == vs->variables[i])
+//            return 1;
+//    return 0;
+//}
 
 /////////////////////////////////////////////////////////////////////////////////
-// Variable sets.
+// Linked-list based variable sets.
 
 VariableSet makeVariableSet(Context context)
 {
@@ -1379,12 +1188,12 @@ int addVariable(VariableSet set, Variable variable)
     set->link = link;
     return 1;
 }
-
-void addVariables(VariableSet set, VariableSetLink link)
-{
-    for (; link; link = link->link)
-        addVariable(set, link->variable);
-}
+//
+//void addVariables(VariableSet set, VariableSetLink link)
+//{
+//    for (; link; link = link->link)
+//        addVariable(set, link->variable);
+//}
 
 void freeVariableSet(VariableSet set)
 {
@@ -1409,7 +1218,7 @@ VariableSetLink copyL(Context context, VariableSetLink set)
 		VariableSetLink copy = ALLOCATE(context, sizeof(struct _VariableSetLink));
 		copy->link = NULL;
 		copy->nr = 1;
-		copy->variable = link->variable;
+		copy->variable = linkVariable(context, link->variable);
 
 		if (!top)
 			top = copy;
@@ -1431,7 +1240,10 @@ unsigned countL(VariableSetLink set)
 VariableSetLink addVariableL(Context context, VariableSetLink set, Variable variable)
 {
 	if (variable == NULL)
+	{
+	    unlinkVariable(context, variable);
 		return set;
+	}
 
 	if (set == NULL)
 	{
@@ -1453,10 +1265,12 @@ VariableSetLink addVariableL(Context context, VariableSetLink set, Variable vari
 
 		VariableSetLink link = ALLOCATE(context, sizeof(struct _VariableSetLink));
 		link->nr = 1;
-		link->variable = variable;
+		link->variable = variable; // Transfer ref
 		link->link = set; // Transfer ref
 		set = link;
 	}
+	else
+	    unlinkVariable(context, variable);
 
 	return set;
 }
@@ -1834,11 +1648,15 @@ Hashset copyHS(Context context, Hashset set)
 Hashset addVariableHS(Context context, Hashset set, Variable variable)
 {
 	if (set == AllFreeVariables)
+	{
+	    unlinkVariable(context, variable);
 		return set;
+	}
 
 	if (set && set->nitems > 100)
 	{
-		UNLINK_Hashset(context, set);
+	    unlinkVariable(context, variable);
+	    UNLINK_Hashset(context, set);
 		return AllFreeVariables;
 	}
 
@@ -2021,12 +1839,6 @@ Hashset removeAllHS(Context context, Hashset set, Variable* vars, int len)
 			break;
 	}
 
-//	if (set && set->nitems == 0)
-//	{
-//		UNLINK_Hashset(context, set);
-//		return NULL;
-//	}
-
 	return set;
 }
 
@@ -2083,6 +1895,20 @@ Hashset UNLINK_Hashset(Context context, Hashset set)
 		ASSERT(context, set->nr > 0);
 		if (--set->nr == 0)
 		{
+		    int i = set->capacity - 1;
+            int r = set->nitems;
+            for (; i >= 0; i --)
+            {
+                size_t item = set->items[i];
+                if (item != 0 && item != 1)
+                {
+                    Variable v = (Variable) item;
+                    unlinkVariable(context, v);
+                }
+                r --;
+                if (r == 0)
+                    break;
+            }
 			FREE(context, set->items);
 			FREE(context, set);
 			return NULL;
@@ -2091,7 +1917,6 @@ Hashset UNLINK_Hashset(Context context, Hashset set)
 	return set;
 }
 
-// Clear set
 Hashset clearHS(Context context, Hashset set)
 {
 	if (!set || set == AllFreeVariables)
@@ -2099,16 +1924,6 @@ Hashset clearHS(Context context, Hashset set)
 
 	UNLINK_Hashset(context, set);
 	return NULL;
-	//
-//	if (set->nr > 1)
-//	{
-//		set->nr --;
-//		return makeHS(context);
-//	}
-//
-//	memset(set->items, 0, set->capacity * sizeof(size_t));
-//	set->nitems = 0;
-//	return set;
 }
 
 ///////////////////////////////////////////////////
@@ -2629,6 +2444,67 @@ void addVariablesOfHS2(Context context, VariableSet vars, Hashset2 set, int cons
 		}
 	}
 }
+//////////////////////////////////////
+// Bitset based variable set
+
+unsigned
+countBS(CWBitSet set)
+{
+    return 0; // TODO
+}
+
+CWBitSet
+addVariableBS(Context context, CWBitSet set, Variable variable)
+{
+    return set;
+}
+
+int
+containsBS(CWBitSet set, Variable variable)
+{
+    return 0;
+}
+
+int
+containsNameBS(CWBitSet link, char* name)
+{
+    return 0;
+}
+
+VariableSetLink variableSetLinkForBS(CWBitSet link, Variable variable)
+{
+    return NULL;
+}
+
+CWBitSet
+mergeAllBS(Context context, CWBitSet first, CWBitSet second)
+{
+    return NULL;
+}
+
+CWBitSet
+minusBS(Context context, CWBitSet set, CWBitSet other)
+{
+    return NULL;
+}
+
+CWBitSet
+removeAllBS(Context context, CWBitSet set, Variable* vars, int len)
+{
+    return NULL;
+}
+
+CWBitSet
+clearBS(Context context, CWBitSet set)
+{
+
+}
+
+void
+printfBS(Context context, FILE* out, CWBitSet set)
+{
+
+}
 
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -2697,6 +2573,7 @@ void freeVariableMap(VariableMap map)
     }
     FREE(map->context, map);
 }
+
 
 /////////////////////////////////////////////////////////////////////////////////
 // Map from names to variables.
@@ -2839,14 +2716,6 @@ void mangle(int length, const char *original, char *mangled)
         mangled[i] = (c == '/' ? '_' : c);
     }
 }
-
-//char* makeMangle(Context context, const char* src)
-//{
-//    size_t l = strlen(src);
-//    char* mangled = ALLOCATE(context, l + 1);
-//    mangle(l, src, mangled);
-//    return mangled;
-//}
 
 // Interpret one Unicode relaxed UTF-8 character starting at s into codepoint c.
 // NOTE: leaves s on last character in sequence (this leaves s untouched for 7-bit characters)
@@ -3291,6 +3160,7 @@ void sendSplit(char *string, char *sep, Sink sink)
   while (depth-- > 0) END(sink, _M__sCons);
 }
 
+// TODO: should enable the function below for proper pattern handling
 
 //void sendSplit(char* str, char* pat, Sink sink)
 //{
@@ -3499,9 +3369,8 @@ void normalize(Context context, Term *termp)
                     UNLINK(context, (topContextEntry(stack)->term));
                     popContextEntry(stack);
                     // TODO: swap the transfers to avoid extra UNLINK.
-#ifdef FREEVARS
-                   	propagateFreeVariables(context, parent);
-#endif
+
+                    propagateFreeVariables(context, parent);
                 }
             }
         }
@@ -3753,14 +3622,13 @@ void metaSubstitute(Sink sink, Term term, SubstitutionFrame substitution)
 
 // Helper: metaSubstituteTerm(sink, term, substitution, unexhaustedp, unweakened, renamings, substituteUnexhaustedp, substituteUnweakened)
 //   sink - where we send events to
-//   term - the redex fragment that we are copying
+//   term - the redex fragment that we are copying. Reference is transferred
 //   substitution - substitutions to perform in the redex: maps variables to non-redex terms
 //   substitutionCount - size of substitution (number of substituted variables)
 //   unexhaustedp - (pointer to global) bits for all substituted variables, cleared after linear variables have been substituted
 //   unweakened - bits for all substituted variables, cleared under weakening of the variable
 //   metaSubstituteSizep - pointer to size counter for this substitution (TODO: omit when optimizing?)
 //
-// NOTE: Term reference is transferred.
 static void metaSubstituteTerm(Sink sink, Term term, SubstitutionFrame substitution, int substitutionCount, BitSetP unexhausted, BitSetP unweakened, long *metaSubstituteSizep, int top)
 {
 	++(*metaSubstituteSizep);
@@ -3795,54 +3663,16 @@ static void metaSubstituteTerm(Sink sink, Term term, SubstitutionFrame substitut
         }
 
         // (2) Variable that is not substituted: just echo.
-        USE(sink, v);
+        USE(sink, linkVariable(sink->context, v));
         UNLINK(sink->context, term);
     }
     else // IS_CONSTRUCTION(term)
     {
         Construction construction = asConstruction(term);
 
-        // - Add weakenings.
+        // - Check free variables
         BitSet localUnweakened; COPY_LBITS(sink->context, &localUnweakened, substitutionCount, unweakened);
 
-#ifdef WEAKENINGS
-        {
-            VariableSetLink *wsp = &(construction->weakenings);
-            while (*wsp)
-            {
-                Variable v = (*wsp)->variable;
-                SubstitutionFrame s;
-                for (s = substitution; s; s = s->parent)
-                {
-                	const int offset = s->parentCount;
-                    int i;
-                    for (i = 0; i < s->count; ++i)
-                    {
-                        if (v == s->variables[i])
-                        {
-                            // - Weakening of variable we are substituting: remove from bitmap!
-                        	CLEAR_LBIT(&localUnweakened, offset+i);
-
-                        	if (IS_VARIABLE_USE(s->substitutes[i]))
-							{
-								if (s->renamings && (s->renamings == RENAME_ALL || s->renamings[i]))
-								{
-									// The binder has been renamed. Scoping is preserved, so it is safe to rename the weakening
-									sink->weaken(sink, VARIABLE(s->substitutes[i]));
-								}
-							}
-
-                            goto WeakeningDone; // break out of both inner loops to process next weakening
-                        }
-                    }
-                }
-              WeakeningDone:
-                wsp = &((*wsp)->link);
-            }
-        }
-#endif
-
-#ifdef FREEVARS
 		SubstitutionFrame s = substitution;
 		for (; s; s = s->parent)
 		{
@@ -3858,8 +3688,6 @@ static void metaSubstituteTerm(Sink sink, Term term, SubstitutionFrame substitut
 				}
 			}
 		}
-
-#endif
 
         BitSet bitset; COPY_LBITS(sink->context, &bitset, substitutionCount, unexhausted);
         MASK_LBITS(&bitset, &localUnweakened);
@@ -3946,8 +3774,10 @@ static void metaSubstituteTerm(Sink sink, Term term, SubstitutionFrame substitut
 				// --- send new binders
 				BINDS(sink, rank, subBinders); // escape of subBinders!
 				FREE(sink->context, subBinders);
+
 				// --- now process subterm!
 				metaSubstituteTerm(sink, LINK(sink->context, SUB(term, i)), subSubstitution, subSubstitutionCount, &subUnexhausted, &subUnweakened, metaSubstituteSizep, 1);
+
 				// --- (end of scope for subSubstitution, subUnweakened, and subUses)
 				MASK_LBITS(unexhausted, &subUnexhausted);
 
@@ -3983,11 +3813,8 @@ static void metaSubstitutePropertiesPrefix(Sink sink, Construction construction,
         {
         	BitSet bitset; COPY_LBITS(sink->context, &bitset, substitutionCount, unexhausted);
         	MASK_LBITS(&bitset, &localUnweakened);
-#ifdef FREEVARS
-            if (IS_PROPERTY_CLOSED(namedLink) || (!ANY_LBITS(&bitset) && !mergeNamedProperties))
-#else
-            if ((!ANY_LBITS(&bitset) && !mergeNamedProperties))
-#endif
+
+        	if (IS_PROPERTY_CLOSED(namedLink) || (!ANY_LBITS(&bitset) && !mergeNamedProperties))
             {
                 // No more variables to metaSubstitute...the prefix is done!
                 break;
@@ -4018,53 +3845,7 @@ static void metaSubstitutePropertiesPrefix(Sink sink, Construction construction,
             }
             else
             {
-#ifdef WEAKENINGS
-                Variable v = namedLink->u.weakening;
-                NamedPropertyLink weakening = namedLink; // By default, preserve weakening
-                SubstitutionFrame s;
-                for (s = substitution; s; s = s->parent)
-                {
-                	const int offset = s->parentCount;
-                    int i;
-                    for (i = 0; i < s->count; ++i)
-                    {
-                        if (v == s->variables[i])
-                        {
-                            // - Weakening for a substituted variable - clear bit
-                            CLEAR_LBIT(&localUnweakened, offset+i);
-
-                            if (IS_VARIABLE_USE(s->substitutes[i]))
-							{
-								// Renaming: update weakening
-								weakening = ALLOCATE(sink->context, sizeof(struct _NamedPropertyLink));
-								weakening->link = NULL;
-								weakening->nr = 1;
-								weakening->name = NULL;
-								weakening->u.weakening = VARIABLE(s->substitutes[i]);
-							}
-							else
-							{
-								weakening = NULL;
-							}
-
-                            goto NamedWeakeningDone;
-                        }
-                    }
-                }
-
-            NamedWeakeningDone:
-				if (weakening)
-				{
-					pushNamedPropertyLink(namedStack, LINK_NamedPropertyLink(sink->context, weakening));
-					++(*metaSubstituteSizep);
-				}
-#endif
-
-#ifdef FREEVARS
-				// TODO:
-
 				// The sink automatically computes free variables
-#endif
 
             }
         }
@@ -4081,7 +3862,6 @@ static void metaSubstitutePropertiesPrefix(Sink sink, Construction construction,
         	BitSet bitset; COPY_LBITS(sink->context, &bitset, substitutionCount, unexhausted);
         	MASK_LBITS(&bitset, &localUnweakened);
 
-            //if (!ANY_LBITS(AND_LBITS(*unexhaustedp, localUnweakened)) && !mergeVariableProperties)
         	if (!ANY_LBITS(&bitset) && !mergeVariableProperties)
             {
                 // No more variables to metaSubstitute...the prefix is done!
@@ -4117,7 +3897,7 @@ static void metaSubstitutePropertiesPrefix(Sink sink, Construction construction,
                     // Mapped variable not (further) renamed - include in prefix after value substitution.
                     VariablePropertyLink newLink = ALLOCATE(sink->context, sizeof(struct _VariablePropertyLink));
                     newLink->link = NULL;
-                    newLink->variable = key;
+                    newLink->variable = linkVariable(sink->context, key);
                     newLink->nr = 1;
                     Sink propertysink = ALLOCA_BUFFER(sink->context);
                     BitSet localUnweakenedC; COPY_LBITS(sink->context, &localUnweakenedC, substitutionCount, &localUnweakened);
@@ -4130,51 +3910,8 @@ static void metaSubstitutePropertiesPrefix(Sink sink, Construction construction,
             }
             else
             {
-#ifdef WEAKENINGS
-                Variable v = variableLink->u.weakening;
-                VariablePropertyLink weakening = variableLink; // By default, preserve weakening
-                SubstitutionFrame s;
-                for (s = substitution; s; s = s->parent)
-                {
-                	const int offset = s->parentCount;
-                    int i;
-                    for (i = 0; i < s->count; ++i)
-                    {
-                        if (v == s->variables[i])
-                        {
-                            // - Weakening is for a substituted variable!
-                            CLEAR_LBIT(&localUnweakened, offset+i);
-
-                            if (IS_VARIABLE_USE(s->substitutes[i]))
-							{
-								// Renaming: update weakening
-								weakening = ALLOCATE(sink->context, sizeof(struct _VariablePropertyLink));
-								weakening->link = NULL;
-								weakening->nr = 1;
-								weakening->variable = NULL;
-								weakening->u.weakening = VARIABLE(s->substitutes[i]);
-							}
-							else
-							{
-								weakening = NULL;
-							}
-                            goto VariableWeakeningDone;
-                        }
-                    }
-                }
-            VariableWeakeningDone:
-				if (weakening)
-				{
-					pushVariablePropertyLink(variableStack, LINK_VariablePropertyLink(sink->context, weakening));
-					++(*metaSubstituteSizep);
-				}
-#endif
-
-#ifdef FREEVARS
-				// TODO: clear bit
-				// The sink automatically computes free variables
-#endif
-
+				// TODO: clear localUnweakened bit???
+				// The sink automatically computes free variables. Nothing to do.
             }
         }
         FREE_LBITS(sink->context, &localUnweakened);
@@ -4242,11 +3979,7 @@ static void metaSubstituteProperties(Sink sink, Construction construction, Subst
         const char *key = link->name;
         if (key)
             ADD_PROPERTY_NAMED(sink, key, LINK(sink->context, link->u.term));
-#ifdef WEAKENINGS
-        //  Weakenings are added once during variable weakening phase.
-        //else if (IS_BOUND(link->u.weakening))
-        //    ADD_PROPERTY_WEAKEN(sink, link->u.weakening);
-#endif
+
         UNLINK_NamedPropertyLink(sink->context, link);
     }
     freeNamedPropertyLinkStack(namedStack);
@@ -4257,11 +3990,8 @@ static void metaSubstituteProperties(Sink sink, Construction construction, Subst
         popVariablePropertyLink(variableStack);
         Variable key = link->variable;
         if (key)
-            ADD_PROPERTY_VARIABLE(sink, key, LINK(sink->context, link->u.term));
-#ifdef WEAKENINGS
-        else if (IS_BOUND(link->u.weakening))
-            ADD_PROPERTY_WEAKEN(sink, link->u.weakening);
-#endif
+            ADD_PROPERTY_VARIABLE(sink, linkVariable(sink->context, key), LINK(sink->context, link->u.term));
+
         UNLINK_VariablePropertyLink(sink->context, link);
     }
     freeVariablePropertyLinkStack(variableStack);
@@ -4314,47 +4044,9 @@ static void metaSubstituteTermUpdate(Context context, Term *termp, SubstitutionF
     {
         Construction construction = asConstruction(*termp);
 
-        // - Clear bit set based on weakenings.
+        // - Clear bit set based on free variables.
         BitSet localUnweakened; COPY_LBITS(context, &localUnweakened, substitutionCount, unweakened);
 
-#ifdef WEAKENINGS
-        {
-            VariableSetLink *wsp = &(construction->weakenings);
-            while (*wsp)
-            {
-                Variable v = (*wsp)->variable;
-                SubstitutionFrame s;
-                for (s = substitution; s; s = s->parent)
-                {
-                	const int offset = s->parentCount;
-                    int i;
-                    for (i = 0; i < s->count; ++i)
-                    {
-                        if (v == s->variables[i])
-                        {
-                            // - Weakening of variable we are substituting: remove from bitmap!
-                        	CLEAR_LBIT(&localUnweakened, offset+i);
-
-                        	if (IS_VARIABLE_USE(s->substitutes[i]))
-							{
-								if (s->renamings && (s->renamings == RENAME_ALL || s->renamings[i]))
-								{
-									// The binder has been renamed. Scoping is preserved, so it is safe to rename the weakening
-									(*wsp)->variable = VARIABLE(s->substitutes[i]);
-								}
-							}
-
-                        	goto WeakeningDone; // break out of both inner loops to process next weakening
-                        }
-                    }
-                }
-              WeakeningDone:
-                wsp = &((*wsp)->link);
-            }
-        }
-#endif
-
-#ifdef FREEVARS
 		SubstitutionFrame s;
 		for (s = substitution; s; s = s->parent)
 		{
@@ -4370,19 +4062,12 @@ static void metaSubstituteTermUpdate(Context context, Term *termp, SubstitutionF
 				}
 			}
 		}
-#endif
 
     	BitSet bitset; COPY_LBITS(context, &bitset, substitutionCount, unexhausted);
        	MASK_LBITS(&bitset, &localUnweakened);
         if (!ANY_LBITS(&bitset))
         {
             // (3) No further substitution is possible, so leave it.
-
-#ifdef WEAKENINGS
-        	// Construction weakenings can be preserved.
-        	if (pendingWeakenings)
-        		construction->weakenings = mergeAllL(context, copyL(context, pendingWeakenings), construction->weakenings);
-#endif
             return;
         }
 
@@ -4402,60 +4087,6 @@ static void metaSubstituteTermUpdate(Context context, Term *termp, SubstitutionF
 		construction->variableProperties = NULL;
 
 		VariableSetLink localPendingWeakenings = NULL;
-#ifdef WEAKENINGS
-		// Insert pushed down weakenings. Might be pushed down even further.
-		if (pendingWeakenings)
-			construction->weakenings = mergeAllL(context, copyL(context, pendingWeakenings), construction->weakenings);
-
-		localPendingWeakenings = pendingWeakenings;
-		if (localPendingWeakenings)
-			localPendingWeakenings = copyL(context, localPendingWeakenings);
-
-		// Update weakenings.
-		if (construction->weakenings)
-		{
-			if (construction->weakenings->nr > 1)
-				construction->weakenings = copyL(context, construction->weakenings);
-
-			// Need to intersect with substitute weakenings
-			VariableSetLink holder = NULL;
-
-			SubstitutionFrame s;
-			for (s = substitution; s ; s = s->parent)
-			{
-				const int offset = s->parentCount;
-				int i = 0;
-				for (; i < s->count; ++i)
-				{
-					if (LBIT(&localUnweakened, offset + i)) // Still not weakened?
-					{
-						Term t = s->substitutes[i];
-
-						if (IS_CONSTRUCTION(t))
-						{
-							VariableSetLink w = asConstruction(t)->weakenings;
-
-							construction->weakenings = intersectGL(context, construction->weakenings, w, &holder);
-
-							// Add removed weakenings to list of weakening to propagate down.
-							if (localPendingWeakenings)
-								localPendingWeakenings = mergeAllL(context, localPendingWeakenings, holder);
-							else
-								localPendingWeakenings = holder; // Transfer ref
-
-							holder = NULL;
-						}
-						else // Variable
-							construction->weakenings = removeL(context, construction->weakenings, VARIABLE(t));
-					}
-
-					if (construction->weakenings == NULL)
-						goto UpdateWeakenings;
-				}
-			}
-			UpdateWeakenings : {};
-		}
-#endif
 
 		// - send property-less term to buffer (note: no substitution, relies on bufferCopy reference semantics).
 		COPY(sink, (Term) construction);  // Transfer reference (for term also)
@@ -4514,18 +4145,14 @@ static void metaSubstituteTermUpdate(Context context, Term *termp, SubstitutionF
 
         asConstruction(term)->nostep = 0;
 
-#ifdef FREEVARS
         // Propagate free variables up
         propagateFreeVariables(context, term);
-#endif
     }
 }
 
 
 /////////////////////////////////////////////////////////////////////////////////
 // Free variables
-
-#ifdef FREEVARS
 
 void propagateFreeVariables(Context context, Term term)
 {
@@ -4548,34 +4175,6 @@ void propagateFreeVariables(Context context, Term term)
 			c->vfvs = LINK_VARIABLESET(context, variablePropertyFreeVars(c->variableProperties));
 		}
 	}
-//	else if (arity == 1)
-//	{
-//		Term sub = SUB(term, 0);
-//
-//		UNLINK_VARIABLESET(context, c->fvs);
-//		c->fvs = freeVars(context, sub); // has a ref
-//
-//		VARIABLESET nfvs = namedPropertyFreeVars(c->namedProperties); // no ref
-//		if (c->nfvs != nfvs)
-//		{
-//			UNLINK_VARIABLESET(context, c->nfvs);
-//			c->nfvs =  LINK_VARIABLESET(context, nfvs);
-//		}
-//		VARIABLESET vfvs = namedPropertyFreeVars(c->variableProperties); // no ref
-//		if (c->vfvs != vfvs)
-//		{
-//			UNLINK_VARIABLESET(context, c->vfvs);
-//			c->vfvs =  LINK_VARIABLESET(context, vfvs);
-//		}
-//
-//		if (IS_CONSTRUCTION(sub))
-//		{
-//			Construction sc = asConstruction(sub);
-//
-//			c->nfvs = VARIABLESET_MERGEALL(context, c->nfvs, LINK_VARIABLESET(context, sc->nfvs));
-//			c->vfvs = VARIABLESET_MERGEALL(context, c->vfvs, LINK_VARIABLESET(context, sc->vfvs));
-//		}
-//	}
 	else
 	{
 		// General case: merge.
@@ -4641,8 +4240,6 @@ void propagateFreeVariables(Context context, Term term)
 	}
 }
 
-#endif
-
 // Helper adding modified location properties.
 void passLocationProperties(Context context, Term locTerm, Term term)
 {
@@ -4705,7 +4302,8 @@ void freeTerm(Context context, Term term)
 {
     if (IS_VARIABLE_USE(term))
     {
-        FREE(context, term); // not freeing variables here!
+        unlinkVariable(context, VARIABLE(term));
+        FREE(context, term);
     }
     else
     {
@@ -4716,18 +4314,12 @@ void freeTerm(Context context, Term term)
         UNLINK_VariablePropertyLink(context, construction->variableProperties);
         //construction->variableProperties = NULL;
 
-#ifdef FREEVARS
         UNLINK_VARIABLESET(context, construction->fvs);
         construction->fvs = NULL;
         UNLINK_VARIABLESET(context, construction->nfvs);
         construction->nfvs = NULL;
         UNLINK_VARIABLESET(context, construction->vfvs);
         construction->nfvs = NULL;
-#endif
-
-#ifdef WEAKENINGS
-        construction->weakenings = NULL;
-#endif
 
         // Subterms and binders.
         const int arity = ARITY(term);
@@ -4795,15 +4387,15 @@ VariablePropertyLink UNLINK_VariablePropertyLink(Context context, VariableProper
 		{
 			if (link->variable)
 			{
+			    unlinkVariable(context, link->variable);
 				UNLINK(context, link->u.term);
 			}
-#ifdef FREEVARS
 			else
 			{
 				UNLINK_VARIABLESET(context, (VARIABLESET) link->u.weakening);
 				link->u.weakening = NULL;
 			}
-#endif
+
 			UNLINK_VariablePropertyLink(context, link->link);
 			link->link = NULL;
 			FREE(context, link);
@@ -4823,6 +4415,7 @@ VariableSetLink UNLINK_VariableSetLink(Context context, VariableSetLink link)
 
 		VariableSetLink next = link->link;
 		link->link = NULL;
+		unlinkVariable(context, link->variable);
 		link->variable = NULL;
 		FREE(context, link);
 		link = next;
@@ -5158,7 +4751,7 @@ static void computeFreeVariables2(VariableSet freevars, Term term, VariableSetLi
 			{
 				VariableSetLink newLink = ALLOCATE(freevars->context, sizeof(struct _VariableSetLink));
 				newLink->nr = 1;
-				newLink->variable = BINDER(term, i, j);
+				newLink->variable = linkVariable(freevars->context, BINDER(term, i, j));
 				newLink->link = subBoundLink;
 				subBoundLink = newLink;
 			}
@@ -5229,12 +4822,11 @@ void checkFreeVariables(Context context, Term term)
 VariableSet makeFreeVariableSet(Context context, Term term, SortDescriptor sort, int constrained, VariablePropertyLink props)
 {
     VariableSet free = NULL;
-#ifdef FREEVARS
 
     if (IS_VARIABLE_USE(term))
     {
         free = makeVariableSet(context);
-        addVariable(free, VARIABLE(term));
+        addVariable(free, linkVariable(context, VARIABLE(term)));
     }
     else
     {
@@ -5251,13 +4843,7 @@ VariableSet makeFreeVariableSet(Context context, Term term, SortDescriptor sort,
             return computeFreeVariables(context, term); // Transfer ref
     }
 
-#else
-
-    makeFreeVariableSet2(free, term, sort, constrained, props, (VariableSetLink) NULL);
-
-#endif
     UNLINK(context, term);
-
     return free;
 }
 
@@ -5980,7 +5566,7 @@ void fprintTermTop(Context context, FILE* out, Term term, int depth, VariableSet
                             if (binder)
                             {
                                 //ASSERT(context, !containsVariable(encountered, used, binder));
-                                addVariable(encountered, binder);
+                                addVariable(encountered, linkVariable(context, binder));
                                 *posp += fprintSafeVariableName(context, out, binder, used);
                                 *posp += FPRINTF(context, out, " ");
                             }
@@ -6116,7 +5702,7 @@ void printCTerm2(Context context, Term term, VariableSet allocated, char *sink, 
         if (!containsVariable(allocated, x))
         {
             PRINTF(context, "%.*sVariable %s = MAKE_%s%sVARIABLE(%s->context, \"%s\");\n", indent, SPACES, name, (IS_BOUND(x) ? "BOUND_" : "FRESH_"), (IS_LINEAR(x) ? "LINEAR_" : "PROMISCUOUS_"), sink, name);
-            addVariable(allocated, x);
+            addVariable(allocated, linkVariable(context, x));
         }
         PRINTF(context, "%.*sUSE(%s, %s);\n", indent, SPACES, sink, name);
     }
@@ -6184,7 +5770,7 @@ void printCTerm2(Context context, Term term, VariableSet allocated, char *sink, 
                     {
                         Variable binder = BINDER(term, i, j);
                         PRINTF(context, "%.*s%s = MAKE_%sVARIABLE(%s->context, \"%s\");\n", indent+1, SPACES, binder->name, (IS_LINEAR(binder) ? "LINEAR_" : ""), sink, binder->name);
-                        addVariable(allocated, binder);
+                        addVariable(allocated, linkVariable(context, binder));
                     }
                     PRINTF(context, "%.*s{\n", indent+1, SPACES);
                     PRINTF(context, "%.*sVariable bind_%d[%d] = ALLOCATE(%s->context, %d*sizeof(Variable));\n", indent+2, SPACES, indent+2, rank, sink, rank);
@@ -6192,7 +5778,7 @@ void printCTerm2(Context context, Term term, VariableSet allocated, char *sink, 
                     {
                         Variable binder = BINDER(term, i, j);
                         PRINTF(context, "%.*sbind_%d[%d] = %s;\n", indent+2, SPACES, indent+2, j, binder->name);
-                        addVariable(allocated, binder);
+                        addVariable(allocated, linkVariable(context, binder));
                     }
                     PRINTF(context, "%.*sBINDS(%s, %d, bind_%d);\n", indent+2, SPACES, sink, rank, indent+2);
                     PRINTF(context, "%.*s}\n", indent+1, SPACES);

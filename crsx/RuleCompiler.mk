@@ -3,7 +3,7 @@
 # Standard programs.
 
 CC = gcc
-CCFLAGS=-g -Wall 
+CCFLAGS=-g -w
 #-O3
 
 ICU4CDIR=
@@ -32,18 +32,27 @@ prereq:
 
 # CRSX.
 #
-CRSX_FILES=$(CACHE)/crsx.c $(CACHE)/crsx.h $(CACHE)/crsx_scan.l $(CACHE)/main.c $(CACHE)/linter.c $(CACHE)/linter.h
+CRSX_FILES=$(CACHE)/crsx.c $(CACHE)/crsx.h $(CACHE)/crsx_scan.l $(CACHE)/main.c $(CACHE)/linter.c $(CACHE)/linter.h \
+           $(CACHE)/cwbitset.c $(CACHE)/cwbitset.h   
 
-$(CACHE)/crsx.c $(CACHE)/crsx.h $(CACHE)/crsx_scan.l $(CACHE)/main.c $(CACHE)/linter.c $(CACHE)/linter.h: $(COMPILERSRC)/c/crsx.h $(COMPILERSRC)/c/crsx.c $(COMPILERSRC)/c/crsx_scan.l $(COMPILERSRC)/c/main.c $(COMPILERSRC)/c/linter.c  $(COMPILERSRC)/c/linter.h
+$(CACHE)/crsx.c $(CACHE)/crsx.h $(CACHE)/crsx_scan.l : $(COMPILERSRC)/c/crsx.h $(COMPILERSRC)/c/crsx.c $(COMPILERSRC)/c/crsx_scan.l 
 	@cp $(COMPILERSRC)/c/crsx.h $(CACHE)
 	@cp $(COMPILERSRC)/c/crsx.c $(CACHE)
 	@cp $(COMPILERSRC)/c/crsx_scan.l $(CACHE)
+
+$(CACHE)/main.c : $(COMPILERSRC)/c/main.c 
 	@cp $(COMPILERSRC)/c/main.c $(CACHE)
+
+$(CACHE)/linter.c $(CACHE)/linter.h : $(COMPILERSRC)/c/linter.c  $(COMPILERSRC)/c/linter.h
 	@cp $(COMPILERSRC)/c/linter.c $(CACHE)
 	@cp $(COMPILERSRC)/c/linter.h $(CACHE)
+	
+$(CACHE)/cwbitset.c $(CACHE)/cwbitset.h : $(COMPILERSRC)/c/cwbitset.c  $(COMPILERSRC)/c/cwbitset.h
+	@cp $(COMPILERSRC)/c/cwbitset.c $(CACHE)
+	@cp $(COMPILERSRC)/c/cwbitset.h $(CACHE)
 
 #
-$(CACHE)/crsx.o: $(CACHE)/crsx.c $(CACHE)/crsx.h
+$(CACHE)/crsx.o: $(CACHE)/crsx.c $(CACHE)/crsx.h $(CACHE)/cwbitset.h
 	$(CC) $(CCFLAGS) -I$(CACHE) -c $(CACHE)/crsx.c -o $@
 #
 $(CACHE)/crsx_scan.o: $(CACHE)/crsx_scan.c $(CACHE)/crsx.h 
@@ -53,10 +62,13 @@ $(CACHE)/crsx_scan.c: $(CACHE)/crsx_scan.l
 $(CACHE)/linter.o: $(CACHE)/linter.c $(CACHE)/linter.h $(CACHE)/crsx.h
 	$(CC) $(CCFLAGS) -I$(CACHE) -c $(CACHE)/linter.c -o $@
 #
+$(CACHE)/cwbitset.o: $(CACHE)/cwbitset.c $(CACHE)/cwbitset.h 
+	$(CC) $(CCFLAGS) -I$(CACHE) -c $(CACHE)/linter.c -o $@
+#
 $(CACHE)/main.o: $(CACHE)/main.c $(CACHE)/crsx.h
 	$(CC) $(CCFLAGS) -I$(CACHE) -c $(CACHE)/main.c -o $@
 
-CRSXO_FILES=$(CACHE)/crsx.o $(CACHE)/crsx_scan.o $(CACHE)/main.o $(CACHE)/linter.o
+CRSXO_FILES=$(CACHE)/crsx.o $(CACHE)/crsx_scan.o $(CACHE)/main.o $(CACHE)/linter.o $(CACHE)/cwbitset.o
 
 TARGETS=CRSXC
 
