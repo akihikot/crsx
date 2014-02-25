@@ -4,7 +4,7 @@
 
 CC = gcc
 CCPLUS = g++
-CCFLAGS=-g -Wall 
+CCFLAGS=-g -w
 #-O3
 
 ICU4CLIB=-licui18n -licuuc -licudata
@@ -16,13 +16,14 @@ CRSXCO_FILES=
 #===================================================================================================
 # CRSX.
 #
-CRSX_FILES=crsx.c crsx.h crsx_scan.c main.c linter.c linter.h
-CRSXO_FILES= crsx.o main.o crsx_scan.o linter.o
+CRSX_FILES=crsx.c crsx.h crsx_scan.c main.c linter.c linter.h cwbitset.c cwbitset.h
+CRSXO_FILES= crsx.o main.o crsx_scan.o linter.o cwbitset.o
 
 #
-crsx.o: crsx.c crsx.h
+crsx.o: crsx.c crsx.h cwbitset.c cwbitset.h
 crsx_scan.o: crsx_scan.c crsx.h
 linter.o: linter.c linter.h crsx.h 
+cwbitset.o: cwbitset.c cwbitset.h
 main.o: main.c linter.h crsx.h
 
 
