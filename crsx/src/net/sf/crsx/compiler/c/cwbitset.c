@@ -8,12 +8,11 @@
 #define ONE_BIT   1ULL
 #define IS_EMPTY_SET(set) (!set)
 
-typedef size_t BITS
+typedef size_t BITS;
 
 #define ASIZE(size)   ((size / BITS_PER_WORD) + 1)
 #define AINDEX(index) (index / BITS_PER_WORD)
 #define BINDEX(index) (index % BITS_PER_WORD)
-
 
 // @Brief Copy bit set
 static inline CWBitSet
@@ -42,7 +41,7 @@ cwbitset_unlink(CWBitSet set)
 	set->nr --;
 	if (set->nr == 0)
 	{
-		free(set->bits)
+		free(set->bits);
 		free(set);
 	}
 }
@@ -84,7 +83,7 @@ cwbitset_clearBit(CWBitSet bitset, size_t index)
 	size_t ai = AINDEX(index);
 	size_t bi = BINDEX(index);
 
-	bitset->bits[ai] = bitset->bits[ai] & (~(ONE_BITS << bi));
+	bitset->bits[ai] = bitset->bits[ai] & (~(ONE_BIT << bi));
 	return bitset;
 }
 

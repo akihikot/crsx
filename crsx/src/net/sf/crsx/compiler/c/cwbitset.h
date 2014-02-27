@@ -10,6 +10,7 @@
 extern "C" {
 #endif
 
+#include <stdlib.h>
 #include <stdbool.h>
 
 struct _CWBitSet {
@@ -19,6 +20,11 @@ struct _CWBitSet {
 };
 
 typedef struct _CWBitSet* CWBitSet;
+
+/**
+ * @Brief create new bitset with given number of words.
+ */
+CWBitSet cwbitset_new(size_t numwords);
 
 /**
  * @Brief Decrement reference and eventually free set

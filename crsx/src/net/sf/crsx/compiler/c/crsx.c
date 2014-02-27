@@ -532,7 +532,7 @@ Sink bufferEnd(Sink sink, ConstructionDescriptor descriptor)
     Term childTerm = bufferTop(buffer)->term;
 
     if (ARITY(childTerm) != bufferTop(buffer)->index)
-        ERRORF(sink->context, "Invalid number of subterms for constructor %s\n", descriptor->name(NULL));
+        ERRORF(sink->context, Crsx, "Invalid number of subterms for constructor %s\n", descriptor->name(NULL));
 
     // Update nf and nostep fields of construction.
     if (IS_DATA(childTerm))

@@ -3,7 +3,7 @@
 # Standard programs.
 
 CC = gcc
-CCFLAGS=-g -w
+CCFLAGS=-g -Wall
 #-O3
 
 ICU4CDIR=
@@ -63,7 +63,7 @@ $(CACHE)/linter.o: $(CACHE)/linter.c $(CACHE)/linter.h $(CACHE)/crsx.h
 	$(CC) $(CCFLAGS) -I$(CACHE) -c $(CACHE)/linter.c -o $@
 #
 $(CACHE)/cwbitset.o: $(CACHE)/cwbitset.c $(CACHE)/cwbitset.h 
-	$(CC) $(CCFLAGS) -I$(CACHE) -c $(CACHE)/linter.c -o $@
+	$(CC) $(CCFLAGS) -I$(CACHE) -c $(CACHE)/cwbitset.c -o $@
 #
 $(CACHE)/main.o: $(CACHE)/main.c $(CACHE)/crsx.h
 	$(CC) $(CCFLAGS) -I$(CACHE) -c $(CACHE)/main.c -o $@

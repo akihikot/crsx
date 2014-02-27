@@ -533,32 +533,24 @@ struct _Construction
 {
     struct _Term term; // extends _Term with term.descriptor!=NULL
 
-    // TODO: merge into 1 field
     unsigned int nf : 1; // whether subterm known to be normal form
     unsigned int nostep : 1; // whether function construction subterm known to not currently be steppable
 
     NamedPropertyLink namedProperties; // named properties. First link always contains set of free variables (unless all properties are closed)
     VariablePropertyLink variableProperties; // variable properties. First link always contains set of free variables (never closed)
-#ifdef WEAKENINGS
-    VariableSetLink weakenings; // free binders known to not occur in subterm (including properties)
-#endif
-#ifdef FREEVARS
+
     VARIABLESET fvs;  // free variables known to occur in subterm (excluding properties)
     VARIABLESET nfvs; // free variables known to occur in named properties (on this construction and subterms)
     VARIABLESET vfvs; // free variables known to occur in variable properties (on this construction and subterms)
-#endif
+
     Term sub[]; // subterms -- actual size is ARITY(term)
     // Variable binder[]; // binders -- actual size is term->descriptor->binderoffset[ARITY(term)]
 };
-
-#ifdef FREEVARS
 
 // Helper computing free variables from child terms.
 extern void propagateFreeVariables(Context context, Term term);
 
 extern VARIABLESET AllFreeVariables;
-
-#endif
 
 // Helper adding modified location properties.
 extern void passLocationProperties(Context context, Term locTerm, Term term);
